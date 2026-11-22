@@ -86,7 +86,7 @@ pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
                 }
                 let label = data[pos + 1];
                 if label == 0xFE {
-                    // Comment Extension — skip and report
+                    // Comment Extension - skip and report
                     pos += 2;
                     let mut comment_bytes = 0usize;
                     while pos < data.len() {

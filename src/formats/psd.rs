@@ -1,22 +1,22 @@
 use anyhow::{bail, Result};
 use crate::report::StripReport;
 
-// Image resource IDs to strip
-const STRIP_IDS: &[u16] = &[
-    0x0404, // IPTC-NAA
-    0x040C, // Thumbnail (old)
-    0x040F, // ICC profile
-    0x0411, // ICC untagged flag
-    0x0416, // Unicode alpha names
-    0x0419, // Print scale
-    0x0422, // XMP metadata
-    0x0424, // Print info
-    0x0425, // Print style
-    0x0426, // Macintosh NSPrintInfo
-    0x0427, // Windows DEVMODE
-    0x0428, // Auto save file path
-    0x0429, // Auto save format
-    0x042A, // Path selection state
+// Image resource IDs to strip, with their names.
+const STRIP_IDS: &[(u16, &str)] = &[
+    (0x0404, "IPTC-NAA"),
+    (0x040C, "thumbnail (old)"),
+    (0x040F, "ICC profile"),
+    (0x0411, "ICC untagged flag"),
+    (0x0416, "Unicode alpha names"),
+    (0x0419, "print scale"),
+    (0x0422, "XMP metadata"),
+    (0x0424, "print info"),
+    (0x0425, "print style"),
+    (0x0426, "Macintosh NSPrintInfo"),
+    (0x0427, "Windows DEVMODE"),
+    (0x0428, "auto-save file path"),
+    (0x0429, "auto-save format"),
+    (0x042A, "path selection state"),
 ];
 
 pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
@@ -37,6 +37,9 @@ pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
     }
     let color_data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
     let color_section_size = 4 + color_data_len;
+    if pos + color_section_size > data.len() {
+        bail!("truncated PSD color mode section");
+    }
     out.extend_from_slice(&data[pos..pos + color_section_size]);
     pos += color_section_size;
 
@@ -77,13 +80,19 @@ pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
             break;
         }
 
-        if STRIP_IDS.contains(&resource_id) {
-            report.add(format!("PSD resource 0x{:04X}", resource_id));
-        } else {
-            new_ir.extend_from_slice(&data[ir_pos..block_end]);
+        match STRIP_IDS.iter().find(|&&(id, _)| id == resource_id) {
+            Some((_, name)) => {
+                report.add(format!("PSD resource 0x{:04X} ({})", resource_id, name));
+            }
+            None => new_ir.extend_from_slice(&data[ir_pos..block_end]), // kept
         }
 
         ir_pos = block_end;
+    }
+    // Malformed section (bad signature or truncated resource): keep the
+    // unparsed remainder verbatim instead of silently dropping it.
+    if ir_pos < ir_end {
+        new_ir.extend_from_slice(&data[ir_pos..ir_end]);
     }
 
     // Write filtered image resources section

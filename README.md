@@ -53,11 +53,36 @@ sudo install -m 755 dist/unmetadata-0.1.0-linux-x86_64 /usr/local/bin/unmetadata
 
 Requires Rust 1.75 or later.
 
+A single native binary needs nothing else:
+
 ```sh
 git clone https://github.com/user/unmetadata
 cd unmetadata
 cargo build --release
 # binary at: target/release/unmetadata
+```
+
+#### Building the `dist/` binaries
+
+The cross-compiled release set (`make release`, or `build-all.sh`) needs these packages installed first:
+
+| Package | Install |
+|---------|---------|
+| Docker (running) | distro package manager, e.g. `sudo pacman -S docker` / `sudo apt install docker.io` |
+| cross 0.2.5 | `cargo install cross --version 0.2.5` |
+| cargo-zigbuild | `cargo install cargo-zigbuild` |
+
+Plus the system tools used by `build-all.sh`:
+
+- `zig` (in PATH) - https://ziglang.org/download or via your package manager
+- `mingw-w64` - `x86_64-w64-mingw32-gcc` in PATH (e.g. `sudo pacman -S mingw-w64-gcc`)
+- `llvm-lipo` - from `llvm` (e.g. `sudo pacman -S llvm`), for the macOS universal binary
+
+Then, from the repo root:
+
+```sh
+make release          # Linux + Windows + FreeBSD via cross, copies to dist/
+bash build-all.sh   # full matrix incl. aarch64/Windows/macOS (needs the tools above)
 ```
 
 ---
@@ -82,7 +107,7 @@ unmetadata [OPTIONS] <PATH>...
 | `--output-dir <DIR>` | Write cleaned copies into `DIR`, preserving filenames |
 | `-r, --recursive` | Recurse into subdirectories |
 | `-n, --dry-run` | Show what would be stripped; no files are modified |
-| `-v, --verbose` | Print each stripped item per file |
+| `-v, --verbose` | Print each stripped item per file; also enables per-file details in the web UI |
 | `-q, --quiet` | Suppress all output except errors |
 | `-j, --jobs <N>` | Worker threads (default: number of CPU cores) |
 | `--serve` | Start the web UI on `http://localhost:3301` |
@@ -147,6 +172,30 @@ Open `http://localhost:3301` in your browser.
 
 The server only binds to `127.0.0.1` - it is not accessible from the network.
 
+### Verbose mode in the web UI
+
+Pass `--verbose` alongside `--serve` to see per-file strip details in both the terminal and the browser:
+
+```sh
+unmetadata --serve --verbose
+```
+
+After each upload, the browser shows what was stripped under every file:
+
+```
+✓ photo.jpg
+  → Removed EXIF (APP1)
+  → Removed GPS data
+  → Removed thumbnail
+
+✓ document.pdf
+  → Removed /Author
+  → Removed /Creator
+
+✓ song.mp3
+  (nothing to strip)
+```
+
 ---
 
 ## Run as a Service
@@ -156,7 +205,7 @@ The server only binds to `127.0.0.1` - it is not accessible from the network.
 Starts automatically when you log in. No root required.
 
 ```sh
-sh scripts/install-service-linux.sh
+sh install-service-linux.sh
 ```
 
 The script:
@@ -180,7 +229,7 @@ journalctl --user -u unmetadata -f    # follow logs
 Requires root. Starts after `LOGIN` is ready.
 
 ```sh
-sudo sh scripts/install-service-freebsd.sh
+sudo sh install-service-freebsd.sh
 ```
 
 The script:
@@ -236,24 +285,44 @@ The atomic rename strategy means a crash mid-write leaves the original intact. T
 The project cross-compiles to 8 targets from a Linux host.
 
 ```sh
-sh scripts/build-all.sh
+bash build-all.sh
 ```
 
-Requirements:
+Not every target can be built with the same tool. The script uses a different tool per target based on what actually works:
 
-| Tool | Used for |
-|------|----------|
-| `cross` (≥ 0.2.5) | Linux x86-64 musl, FreeBSD x86-64 |
-| `cargo zigbuild` (≥ 0.23) | Linux ARM64 musl, macOS x86-64/ARM64, Windows ARM64 |
-| `x86_64-w64-mingw32-gcc` | Windows x86-64 |
-| `llvm-lipo` | macOS universal fat binary |
-| Docker | Required by `cross` |
+| Target | Tool | Reason |
+|--------|------|--------|
+| Linux x86-64 musl | `cross` (Docker) | Works reliably |
+| Linux ARM64 musl | `cargo zigbuild` | `cross` Docker image has older Ubuntu - glibc mismatch at link time |
+| FreeBSD x86-64 | `cross` (Docker) | Works reliably |
+| Windows x86-64 | `cargo` + native MinGW | Same glibc issue in the Windows `cross` container |
+| Windows ARM64 | `cargo zigbuild` | `cross` has no Docker image for `aarch64-pc-windows-gnullvm` |
+| macOS x86-64 | `cargo zigbuild` | `zig` bundles macOS libc headers; no macOS `cross` image |
+| macOS ARM64 | `cargo zigbuild` | Same as above |
+| macOS universal | `llvm-lipo` | Combines both Darwin slices into a fat binary |
 
-Install tools:
+### Install prerequisites
 
 ```sh
+# cross (Docker-based cross-compiler)
 cargo install cross --version 0.2.5
+
+# cargo-zigbuild (uses zig as a cross-linker)
 cargo install cargo-zigbuild
+
+# zig (bundled linker and libc headers for zigbuild)
+# e.g. on Arch: pacman -S zig
+# or download from https://ziglang.org/download
+
+# MinGW-w64 (native Windows x86-64 linker)
+# e.g. on Arch: pacman -S mingw-w64-gcc
+# e.g. on Ubuntu: apt install gcc-mingw-w64-x86-64
+
+# llvm-lipo (for macOS universal binary)
+# e.g. on Arch: pacman -S llvm
+# e.g. on Ubuntu: apt install llvm
+
+# Rust target toolchains
 rustup target add \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
@@ -266,7 +335,7 @@ rustup target add \
 
 Output binaries land in `dist/`.
 
-> **FreeBSD ARM64** (`aarch64-unknown-freebsd`) is not built - it is a Rust tier-3 target with no prebuilt standard library available on the stable toolchain.
+> **FreeBSD ARM64** (`aarch64-unknown-freebsd`) is not built - it is a Rust tier-3 target with no prebuilt standard library on the stable toolchain. Building it requires `nightly` + `-Zbuild-std`.
 
 ---
 

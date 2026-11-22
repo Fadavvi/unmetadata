@@ -10,8 +10,6 @@ pub enum Error {
     },
     #[error("format error in {path}: {message}")]
     Format { path: String, message: String },
-    #[error("unsupported format: {0}")]
-    Unsupported(String),
 }
 
 impl Error {

@@ -1,22 +1,30 @@
 #!/bin/sh
+
 # Installs unmetadata as a FreeBSD rc.d service that starts after login is ready.
 # Must be run as root (needed to write to /usr/local/bin and /usr/local/etc/rc.d).
 #
 # The service starts 'unmetadata --serve' on http://localhost:3301.
 # It runs as the user specified by $unmetadata_user in rc.conf (default: nobody).
 # To run as a specific user, add to /etc/rc.conf:
-#   unmetadata_user="myuser"
+# unmetadata_user="myuser"
 
 set -e
 
 BINARY_NAME="unmetadata"
+GITHUB_REPO="fadavvi/unmetadata"          # change to your fork if needed
 INSTALL_BIN="/usr/local/bin/${BINARY_NAME}"
 RC_SCRIPT="/usr/local/etc/rc.d/${BINARY_NAME}"
 RC_CONF="/etc/rc.conf"
 PID_DIR="/var/run"
 LOG_DIR="/var/log"
 
-# ── must be root ──────────────────────────────────────────────────────────────
+# temp-file cleanup
+
+TMPFILE=""
+cleanup() { [ -n "${TMPFILE}" ] && rm -f "${TMPFILE}"; }
+trap cleanup EXIT
+
+# must be root
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "error: this script must be run as root" >&2
@@ -24,15 +32,19 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# ── locate binary ─────────────────────────────────────────────────────────────
+# locate binary 
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DIST_DIR="${SCRIPT_DIR}/../dist"
-VERSION="0.1.0"
+# Works whether the script lives in the project root or in scripts/
+if [ -d "${SCRIPT_DIR}/dist" ]; then
+  DIST_DIR="${SCRIPT_DIR}/dist"
+else
+  DIST_DIR="${SCRIPT_DIR}/../dist"
+fi
 ARCH="$(uname -m)"
 
 case "${ARCH}" in
-  amd64|x86_64) DIST_BINARY="${DIST_DIR}/${BINARY_NAME}-${VERSION}-freebsd-x86_64" ;;
+  amd64|x86_64) GLOB_PATTERN="${BINARY_NAME}-*-freebsd-x86_64" ;;
   *)
     echo "error: unsupported architecture: ${ARCH}" >&2
     echo "       only freebsd-x86_64 binaries are distributed." >&2
@@ -40,22 +52,53 @@ case "${ARCH}" in
     ;;
 esac
 
-if [ -f "${DIST_BINARY}" ]; then
+# Find the newest matching binary in dist/ (handles any version string)
+DIST_BINARY="$(find "${DIST_DIR}" -maxdepth 1 -name "${GLOB_PATTERN}" | sort -V | tail -1)"
+
+if [ -n "${DIST_BINARY}" ] && [ -f "${DIST_BINARY}" ]; then
   SOURCE="${DIST_BINARY}"
 elif command -v "${BINARY_NAME}" >/dev/null 2>&1; then
   SOURCE="$(command -v "${BINARY_NAME}")"
 else
-  echo "error: cannot find ${BINARY_NAME} binary." >&2
-  echo "       expected: ${DIST_BINARY}" >&2
-  exit 1
+  # fetch from GitHub releases
+  echo "no local binary found - fetching latest release from github.com/${GITHUB_REPO}"
+  ASSET_URL="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+    | grep '"browser_download_url"' \
+    | grep "${GLOB_PATTERN}" \
+    | sed 's|.*"browser_download_url": *"\([^"]*\)".*|\1|' \
+    | head -1)"
+  if [ -z "${ASSET_URL}" ]; then
+    echo "error: could not find a release asset matching '${GLOB_PATTERN}'" >&2
+    echo "       check https://github.com/${GITHUB_REPO}/releases or build from source." >&2
+    exit 1
+  fi
+  TMPFILE="$(mktemp)"
+  echo "downloading: ${ASSET_URL}"
+  curl -fsSL -o "${TMPFILE}" "${ASSET_URL}"
+  chmod 755 "${TMPFILE}"
+  SOURCE="${TMPFILE}"
 fi
 
-# ── install binary ────────────────────────────────────────────────────────────
+# update existing installation 
+
+if [ -f "${RC_SCRIPT}" ]; then
+  echo "existing installation detected - updating binary and restarting service"
+  install -m 755 "${SOURCE}" "${INSTALL_BIN}"
+  echo "updated:  ${INSTALL_BIN}"
+  service unmetadata restart
+  echo "service restarted"
+  echo ""
+  echo "unmetadata web UI is running at http://localhost:3301"
+  echo "service unmetadata status"
+  exit 0
+fi
+
+# fresh install: copy binary
 
 install -m 755 "${SOURCE}" "${INSTALL_BIN}"
 echo "installed: ${INSTALL_BIN}"
 
-# ── write rc.d script ─────────────────────────────────────────────────────────
+# write rc.d script
 
 cat > "${RC_SCRIPT}" <<'RCEOF'
 #!/bin/sh
@@ -132,7 +175,7 @@ RCEOF
 chmod 755 "${RC_SCRIPT}"
 echo "rc.d script written: ${RC_SCRIPT}"
 
-# ── enable in rc.conf ─────────────────────────────────────────────────────────
+# enable in rc.conf
 
 if grep -q "^unmetadata_enable=" "${RC_CONF}" 2>/dev/null; then
   sed -i '' 's/^unmetadata_enable=.*/unmetadata_enable="YES"/' "${RC_CONF}"
@@ -142,7 +185,7 @@ else
   echo "appended to ${RC_CONF}: unmetadata_enable=\"YES\""
 fi
 
-# ── start now ────────────────────────────────────────────────────────────────
+# start now
 
 service unmetadata start
 echo ""
@@ -156,5 +199,5 @@ echo "  service unmetadata start"
 echo "  service unmetadata restart"
 echo ""
 echo "To run as a specific user, add to /etc/rc.conf:"
-echo '  unmetadata_user="myuser"'
+echo 'unmetadata_user="myuser"'
 echo "then: service unmetadata restart"

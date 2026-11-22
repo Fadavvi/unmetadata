@@ -1,8 +1,10 @@
 use anyhow::{bail, Result};
 use crate::report::StripReport;
 
-const VORBIS_COMMENT: u8 = 4;
-const PICTURE: u8 = 6;
+// FLAC metadata block type numbers (https://flac.sourceforge.io/format.html):
+// 0 STREAMINFO, 1 PADDING, 2 APPLICATION, 3 VORBIS_COMMENT, 4 PICTURE.
+const VORBIS_COMMENT: u8 = 3;
+const PICTURE: u8 = 4;
 
 pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
     if data.len() < 4 || &data[0..4] != b"fLaC" {
@@ -30,7 +32,10 @@ pub fn strip(data: &[u8]) -> Result<(Vec<u8>, StripReport)> {
 
         match block_type {
             VORBIS_COMMENT => {
-                report.add("FLAC VorbisComment block");
+                report.add_fields(
+                    "FLAC VorbisComment block".to_string(),
+                    super::vorbis_comment_names(payload),
+                );
             }
             PICTURE => {
                 report.add(format!("FLAC Picture block ({} bytes)", length));

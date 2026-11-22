@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
 use crate::formats;
@@ -12,7 +13,6 @@ pub struct ProcessOptions {
 }
 
 pub struct ProcessResult {
-    pub path: PathBuf,
     pub report: StripReport,
     pub skipped: bool,
     pub skip_reason: Option<String>,
@@ -32,7 +32,6 @@ pub fn process_file(
         Some(f) => f,
         None => {
             return Ok(ProcessResult {
-                path: path.to_path_buf(),
                 report: StripReport::default(),
                 skipped: true,
                 skip_reason: Some("unsupported format".into()),
@@ -40,8 +39,8 @@ pub fn process_file(
         }
     };
 
-    let (cleaned, report) = formats::strip(fmt, &data, &path_str)
-        .map_err(|e| Error::format(&path_str, e.to_string()))?;
+    // formats::strip already wraps handler errors with the path.
+    let (cleaned, report) = formats::strip(fmt, &data, &path_str)?;
 
     if !opts.dry_run {
         let dest = output.unwrap_or(path);
@@ -50,18 +49,33 @@ pub fn process_file(
     }
 
     Ok(ProcessResult {
-        path: path.to_path_buf(),
         report,
         skipped: false,
         skip_reason: None,
     })
 }
 
-/// Write data atomically: write to a sibling temp file, then rename.
+// Process-wide counter so parallel writes never share a temp filename.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write data atomically: write to a unique sibling temp file, then rename.
+/// The temp name includes pid + a per-process sequence number, so two files
+/// with the same basename (e.g. `-r --output-dir` over nested directories)
+/// can't collide on one shared `.tmp` path and clobber each other's rename.
 fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = dest.with_extension(format!(
-        "{}.tmp",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("")
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = dest.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    // Strip the extension manually (Path::with_extension panics on a
+    // dot-prefixed replacement and files without extensions have none).
+    let base = match file_name.rfind('.') {
+        Some(i) if i > 0 => &file_name[..i],
+        _ => file_name,
+    };
+    let tmp = dest.with_file_name(format!(
+        "{}.unmetadata.tmp.{}-{}",
+        base,
+        std::process::id(),
+        n
     ));
     fs::write(&tmp, data)?;
     fs::rename(&tmp, dest).map_err(|e| {

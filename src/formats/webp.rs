@@ -2,7 +2,10 @@ use anyhow::{bail, Result};
 
 use crate::report::StripReport;
 
-// VP8X flags byte bit positions (first byte of the 10-byte VP8X chunk data)
+// VP8X flags byte bit positions (first byte of the 10-byte VP8X chunk data).
+// Per the WebP container spec / libwebp (WebPFeatureFlags):
+//   bit 1 animation (0x02), bit 2 XMP (0x04), bit 3 EXIF (0x08),
+//   bit 4 alpha (0x10), bit 5 ICC profile (0x20).
 const FLAG_ICCP: u8 = 0x20; // bit 5
 const FLAG_EXIF: u8 = 0x08; // bit 3
 const FLAG_XMP: u8 = 0x04;  // bit 2

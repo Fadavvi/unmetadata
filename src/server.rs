@@ -1,24 +1,40 @@
 use std::io::{Cursor, Write as _};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
+    Json,
     Router,
-    extract::Multipart,
+    extract::{Multipart, State},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use http::{StatusCode, header};
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::formats;
+use crate::report::StripReport;
 
-pub async fn serve() -> Result<()> {
+#[derive(Clone)]
+struct AppState {
+    verbose: bool,
+}
+
+pub async fn serve(verbose: bool) -> Result<()> {
+    let state = AppState { verbose };
     let app = Router::new()
         .route("/", get(index))
-        .route("/strip", post(strip));
+        .route("/config", get(config))
+        .route("/strip", post(strip))
+        .with_state(Arc::new(state));
 
     let listener = TcpListener::bind("127.0.0.1:3301").await?;
     eprintln!("unmetadata web UI → http://localhost:3301");
+    if verbose {
+        eprintln!("verbose mode: per-request details will be printed below");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -27,7 +43,10 @@ async fn index() -> Html<&'static str> {
     Html(UI_HTML)
 }
 
-async fn strip(mut multipart: Multipart) -> impl IntoResponse {
+async fn strip(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut is_folder = false;
     let mut folder_name = String::from("folder");
@@ -60,48 +79,80 @@ async fn strip(mut multipart: Multipart) -> impl IntoResponse {
         return error_response(StatusCode::BAD_REQUEST, "no files received");
     }
 
-    // Strip metadata from every file
-    let processed: Vec<(String, Vec<u8>)> = files
+    // Strip metadata; keep report for both terminal logging and JSON response.
+    // A per-file error is captured (not swallowed) so the UI can show which
+    // file failed instead of silently returning its original bytes as 200 OK.
+    let processed: Vec<(String, Vec<u8>, StripReport, Option<String>)> = files
         .into_iter()
         .map(|(name, data)| {
-            let cleaned = formats::detect(&data)
-                .and_then(|fmt| formats::strip(fmt, &data, &name).ok().map(|(b, _)| b))
-                .unwrap_or(data);
-            (name, cleaned)
+            let (cleaned, report, error) = match formats::detect(&data) {
+                None => (data, StripReport::default(), Some("unsupported format".to_string())),
+                Some(fmt) => match formats::strip(fmt, &data, &name) {
+                    Ok((b, r)) => (b, r, None),
+                    Err(e) => (data, StripReport::default(), Some(e.to_string())),
+                },
+            };
+
+            if state.verbose {
+                match &error {
+                    Some(err) => eprintln!("web   {} - error: {}", name, err),
+                    None if report.is_empty() => eprintln!("web   {} - nothing to strip", name),
+                    None => {
+                        eprintln!("web   {}", name);
+                        for item in &report.items {
+                            eprintln!("        - {}", item.summary);
+                            if !item.fields.is_empty() {
+                                eprintln!(
+                                    "            fields: {}",
+                                    item.fields.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            (name, cleaned, report, error)
         })
         .collect();
 
-    if processed.len() == 1 && !is_folder {
-        let (filename, data) = processed.into_iter().next().unwrap();
-        let cd = format!(
-            "attachment; filename=\"{}\"",
-            sanitize(&filename)
-        );
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_DISPOSITION, cd)
-            .body(axum::body::Body::from(data))
-            .unwrap()
+    // Build per-file report for the JSON response (always present; UI shows it only when verbose,
+    // except errors which are always surfaced)
+    let report_json: Vec<Value> = processed
+        .iter()
+        .map(|(name, _, rpt, err)| {
+            let items: Vec<Value> = rpt
+                .items
+                .iter()
+                .map(|i| json!({"summary": i.summary, "fields": i.fields}))
+                .collect();
+            json!({"file": name, "items": items, "error": err})
+        })
+        .collect();
+
+    // Build output file / zip
+    let (out_filename, out_bytes, out_ct) = if processed.len() == 1 && !is_folder {
+        let (filename, data, _, _) = processed.into_iter().next().unwrap();
+        (sanitize(&filename), data, "application/octet-stream".to_string())
     } else {
+        let pairs: Vec<(String, Vec<u8>)> = processed.into_iter().map(|(n, d, _, _)| (n, d)).collect();
         let zip_name = if is_folder {
             format!("{}-cleaned.zip", sanitize(&folder_name))
         } else {
             "files-cleaned.zip".to_string()
         };
-        match build_zip(&processed) {
-            Ok(zip_bytes) => {
-                let cd = format!("attachment; filename=\"{}\"", zip_name);
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/zip")
-                    .header(header::CONTENT_DISPOSITION, cd)
-                    .body(axum::body::Body::from(zip_bytes))
-                    .unwrap()
-            }
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        match build_zip(&pairs) {
+            Ok(zip_bytes) => (zip_name, zip_bytes, "application/zip".to_string()),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
-    }
+    };
+
+    Json(json!({
+        "filename":     out_filename,
+        "content_type": out_ct,
+        "data":         B64.encode(&out_bytes),
+        "report":       report_json,
+    })).into_response()
 }
 
 fn build_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
@@ -117,6 +168,10 @@ fn build_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
         w.finish()?;
     }
     Ok(buf.into_inner())
+}
+
+async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({"verbose": state.verbose}))
 }
 
 fn sanitize(s: &str) -> String {
@@ -322,6 +377,36 @@ main {
 }
 .hint a { color: var(--accent-hi); text-decoration: none; }
 .hint a:hover { text-decoration: underline; }
+
+/* verbose per-file details */
+.file-item { flex-wrap: wrap; }
+.strip-details {
+  width: 100%;
+  margin: 8px 0 2px;
+  padding: 8px 0 0;
+  list-style: none;
+  border-top: 1px solid var(--border);
+  font-size: .77rem;
+}
+.strip-details li {
+  padding: 2px 0 2px 18px;
+  position: relative;
+  color: var(--sub);
+}
+.strip-details li:not(.nothing)::before {
+  content: '→';
+  position: absolute;
+  left: 0;
+  color: var(--accent-hi);
+}
+.strip-details li.nothing { font-style: italic; }
+.strip-details .fields {
+  display: block;
+  margin-top: 2px;
+  padding-left: 14px;
+  color: var(--text);
+  opacity: .75;
+}
 </style>
 </head>
 <body>
@@ -353,7 +438,7 @@ main {
 
   <p class="hint">
     Strips EXIF &bull; IPTC &bull; XMP &bull; GPS &bull; comments &bull; thumbnails &bull; author fields.
-    Files are processed locally &mdash; nothing is stored.
+    Files are processed locally / nothing is stored.
   </p>
 </main>
 
@@ -364,6 +449,9 @@ const fileList   = document.getElementById('file-list');
 const statusBar  = document.getElementById('status-bar');
 const statusMsg  = document.getElementById('status-msg');
 const statusDot  = document.getElementById('status-dot');
+
+let _verbose = false;
+fetch('/config').then(r => r.json()).then(cfg => { _verbose = cfg.verbose; }).catch(() => {});
 
 // ── Drag-and-drop ────────────────────────────────────────────────
 
@@ -467,10 +555,9 @@ async function process(fileEntries, isFolder, folderName) {
       throw new Error(msg || 'server error');
     }
 
-    const blob = await res.blob();
-    const cd = res.headers.get('content-disposition') || '';
-    const m = cd.match(/filename="([^"]+)"/);
-    const filename = m ? m[1] : (isFolder ? folderName + '-cleaned.zip' : 'cleaned-file');
+    const json = await res.json();
+    const blob = b64ToBlob(json.data, json.content_type);
+    const filename = json.filename;
 
     // Trigger download
     const url = URL.createObjectURL(blob);
@@ -481,7 +568,8 @@ async function process(fileEntries, isFolder, folderName) {
     setTimeout(() => URL.revokeObjectURL(url), 2000);
 
     markAll('done');
-    setStatus('ok', `Done — ${filename} downloaded.`);
+    updateFileDetails(json.report);
+    setStatus('ok', `Done - ${filename} downloaded.`);
   } catch (err) {
     markAll('error');
     setStatus('err', `Error: ${err.message}`);
@@ -528,6 +616,45 @@ function fmtSize(n) {
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+}
+
+function b64ToBlob(b64, type) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], {type: type || 'application/octet-stream'});
+}
+
+function updateFileDetails(report) {
+  if (!report) return;
+  report.forEach(({file, items, error}) => {
+    const el = fileList.querySelector(`[data-path="${CSS.escape(file)}"]`);
+    if (!el) return;
+    if (error) {
+      // Per-file errors are always shown, even without -v
+      const badge = el.querySelector('.badge');
+      if (badge) { badge.className = 'badge badge-error'; badge.textContent = statLabel('error'); }
+      const ul = document.createElement('ul');
+      ul.className = 'strip-details';
+      ul.innerHTML = `<li class="nothing">error: ${esc(error)}</li>`;
+      el.appendChild(ul);
+    } else if (_verbose) {
+      const ul = document.createElement('ul');
+      ul.className = 'strip-details';
+      if (!items || items.length === 0) {
+        ul.innerHTML = '<li class="nothing">nothing to strip</li>';
+      } else {
+        ul.innerHTML = items.map(i => {
+          const line = esc(typeof i === 'string' ? i : i.summary);
+          const fields = (typeof i !== 'string' && i.fields && i.fields.length)
+            ? `<span class="fields">${esc(i.fields.join(', '))}</span>`
+            : '';
+          return `<li>${line}${fields}</li>`;
+        }).join('');
+      }
+      el.appendChild(ul);
+    }
+  });
 }
 </script>
 </body>

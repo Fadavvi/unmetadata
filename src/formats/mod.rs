@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::report::StripReport;
-use anyhow::Result;
 
+pub mod bmp;
 pub mod flac;
 pub mod gif;
 pub mod isobmff;
@@ -27,7 +27,9 @@ pub enum Format {
     Tiff,
     /// PSD/PSB Photoshop
     Psd,
-    /// HEIC, HEIF, AVIF, MP4, M4A, M4V — ISO Base Media File Format
+    /// BMP - no standard metadata fields, passes through unchanged
+    Bmp,
+    /// HEIC, HEIF, AVIF, MP4, M4A, M4V - ISO Base Media File Format
     Isobmff,
     Pdf,
     /// DOCX, XLSX, PPTX, ODT, ODS, ODP (all ZIP-based office formats)
@@ -77,6 +79,12 @@ pub fn detect(data: &[u8]) -> Option<Format> {
     // PSD: 38 42 50 53 ("8BPS")
     if data.starts_with(b"8BPS") {
         return Some(Format::Psd);
+    }
+
+    // BMP: "BM" - no standard metadata fields, detected so it passes through
+    // instead of being reported as unsupported.
+    if data.starts_with(b"BM") {
+        return Some(Format::Bmp);
     }
 
     // ISO Base Media File Format (MP4/HEIC/AVIF/M4A):
@@ -150,10 +158,27 @@ fn detect_zip_subtype(data: &[u8]) -> Format {
         {
             return Format::OfficeXml;
         }
-        let compressed_size =
-            u32::from_le_bytes([data[pos + 18], data[pos + 19], data[pos + 20], data[pos + 21]])
-                as usize;
-        pos = fname_end + extra_len + compressed_size;
+
+        // General-purpose bit flag 3 means the sizes in this local header are
+        // deferred to a data descriptor (common for streamed entries), so the
+        // size-based advance below would land inside the file data. Scan for
+        // the next local file header instead.
+        let flags = u16::from_le_bytes([data[pos + 6], data[pos + 7]]);
+        if flags & 0x08 != 0 {
+            let search_from = fname_end + extra_len;
+            match data[search_from..]
+                .windows(4)
+                .position(|w| w == &[0x50, 0x4B, 0x03, 0x04])
+            {
+                Some(off) => pos = search_from + off,
+                None => break,
+            }
+        } else {
+            let compressed_size = u32::from_le_bytes([
+                data[pos + 18], data[pos + 19], data[pos + 20], data[pos + 21],
+            ]) as usize;
+            pos = fname_end + extra_len + compressed_size;
+        }
         checks += 1;
     }
     Format::Zip
@@ -161,7 +186,8 @@ fn detect_zip_subtype(data: &[u8]) -> Format {
 
 fn looks_like_svg(data: &[u8]) -> bool {
     let prefix = &data[..data.len().min(512)];
-    let s = std::str::from_utf8(prefix).unwrap_or("");
+    // Lossy: one non-UTF-8 byte in the header shouldn't disqualify the file.
+    let s = String::from_utf8_lossy(prefix);
     let trimmed = s.trim_start();
     trimmed.starts_with("<?xml") && trimmed.contains("<svg")
         || trimmed.starts_with("<svg")
@@ -169,7 +195,11 @@ fn looks_like_svg(data: &[u8]) -> bool {
 }
 
 /// Dispatch stripping to the appropriate format handler.
-pub fn strip(format: Format, data: &[u8], path: &str) -> Result<(Vec<u8>, StripReport)> {
+pub fn strip(
+    format: Format,
+    data: &[u8],
+    path: &str,
+) -> std::result::Result<(Vec<u8>, StripReport), Error> {
     match format {
         Format::Jpeg => jpeg::strip(data),
         Format::Png => png::strip(data),
@@ -177,6 +207,7 @@ pub fn strip(format: Format, data: &[u8], path: &str) -> Result<(Vec<u8>, StripR
         Format::Gif => gif::strip(data),
         Format::Tiff => tiff::strip(data),
         Format::Psd => psd::strip(data),
+        Format::Bmp => bmp::strip(data),
         Format::Isobmff => isobmff::strip(data),
         Format::Pdf => pdf::strip(data),
         Format::OfficeXml => office::strip(data),
@@ -187,12 +218,49 @@ pub fn strip(format: Format, data: &[u8], path: &str) -> Result<(Vec<u8>, StripR
         Format::Svg => svg::strip(data),
         Format::Zip => zip_fmt::strip(data),
     }
-    .map_err(|e| {
-        anyhow::anyhow!(Error::format(path, e.to_string()))
-    })
+    .map_err(|e| Error::format(path, e.to_string()))
 }
 
 // Re-export zip format handler under an alias to avoid name collision with the `zip` crate.
 mod zip_fmt {
     pub use super::zip::strip;
+}
+
+/// Field names of a Vorbis comment payload (the bytes *after* the ID header:
+/// vendor-string length, vendor string, entry count, then - per the Xiph
+/// v-comment spec - each entry is a 4-byte little-endian length followed by
+/// "NAME=value" bytes, not NUL-terminated).
+/// Names are returned in order of first appearance, deduplicated. A truncated
+/// or malformed block yields whatever could be parsed.
+pub(crate) fn vorbis_comment_names(payload: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    if payload.len() < 4 {
+        return names;
+    }
+    let vlen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut pos = 4 + vlen;
+    if pos.saturating_add(4) > payload.len() {
+        return names;
+    }
+    let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    for _ in 0..count {
+        if pos.saturating_add(4) > payload.len() {
+            break;
+        }
+        let elen = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos.saturating_add(elen) > payload.len() {
+            break;
+        }
+        let entry = &payload[pos..pos + elen];
+        if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+            let name = String::from_utf8_lossy(&entry[..eq]).into_owned();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        pos += elen;
+    }
+    names
 }
